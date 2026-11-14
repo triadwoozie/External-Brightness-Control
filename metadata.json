@@ -1,0 +1,16 @@
+{
+  "name": "External Monitor Control",
+  "description": "Simple, lightweight native GNOME control panel for external DDC/CI monitors (Brightness, Contrast, Volume, Color Presets, RGB Gain, Power).",
+  "uuid": "monitor-control@triadwoozie.github.com",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51"
+  ],
+  "url": "https://github.com/triadwoozie",
+  "version": 1
+}

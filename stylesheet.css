@@ -1,0 +1,41 @@
+/* External Monitor Control - Vanilla GNOME Shell Theming */
+
+.emc-menu-box {
+    min-width: 280px;
+    padding: 6px 0;
+}
+
+.emc-header-label {
+    font-weight: bold;
+    font-size: 1.05em;
+    padding: 4px 8px;
+}
+
+.emc-slider-row {
+    padding: 4px 10px;
+    spacing: 10px;
+}
+
+.emc-slider-label {
+    min-width: 80px;
+    font-size: 0.95em;
+}
+
+.emc-slider-value {
+    min-width: 42px;
+    text-align: right;
+    font-size: 0.9em;
+    font-variant-numeric: tabular-nums;
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.emc-icon {
+    icon-size: 16px;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.emc-status-subtext {
+    font-size: 0.8em;
+    color: rgba(255, 255, 255, 0.6);
+    padding: 0 8px 4px 8px;
+}
