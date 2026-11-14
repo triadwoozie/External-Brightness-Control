@@ -15,27 +15,45 @@ import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
 
 Gio._promisify(Gio.Subprocess.prototype, 'communicate_utf8_async', 'communicate_utf8_finish');
 
-async function runDdcutilAsync(args) {
+// Maximum age of cached monitor state before performing an I2C bus read
+const CACHE_TTL_MS = 4000;
+
+/**
+ * Execute ddcutil asynchronously with performance flags:
+ * --noconfig: Bypasses configuration parsing (shaves ~15ms per call)
+ * --noverify: Bypasses round-trip verify reads on writes (shaves ~200ms per call)
+ */
+async function runDdcutilAsync(args, cancellable = null) {
     try {
         const proc = new Gio.Subprocess({
-            argv: ['ddcutil', ...args],
+            argv: ['ddcutil', '--noconfig', ...args],
             flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
         });
-        proc.init(null);
-        const [stdout, stderr] = await proc.communicate_utf8_async(null, null);
+        proc.init(cancellable);
+        const [stdout, stderr] = await proc.communicate_utf8_async(null, cancellable);
         const status = proc.get_exit_status();
         return { success: status === 0, stdout: stdout || '', stderr: stderr || '' };
     } catch (e) {
+        if (e.matches && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
+            return { success: false, stdout: '', stderr: 'cancelled' };
+        }
         return { success: false, stdout: '', stderr: String(e) };
     }
 }
 
+/**
+ * Serialized asynchronous DDC worker.
+ * Guarantees that only one DDC command accesses the I2C bus at any instant,
+ * eliminating I2C collision errors and dropped packets.
+ */
 class DdcWorker {
     constructor(bus) {
         this._bus = bus;
         this._chain = Promise.resolve();
         this._timers = new Map();
+        this._pendingValues = new Map();
         this._currentPreset = '01'; // Default sRGB
+        this._cancellable = new Gio.Cancellable();
     }
 
     setBus(bus) {
@@ -54,93 +72,130 @@ class DdcWorker {
         return this._currentPreset;
     }
 
-    // Serialized execution: only one ddcutil command touches the I2C bus at a time
     _enqueue(fn) {
         this._chain = this._chain.then(async () => {
+            if (this._cancellable.is_cancelled()) return null;
             try {
                 return await fn();
             } catch (err) {
-                console.error(`[ExternalMonitorControl] DDC worker error: ${err}`);
+                console.error(`[ExternalMonitorControl] Worker error: ${err}`);
+                return null;
             }
         });
         return this._chain;
     }
 
     execute(args) {
-        return this._enqueue(() => runDdcutilAsync(args));
+        return this._enqueue(() => runDdcutilAsync(args, this._cancellable));
     }
 
-    setVcpContinuous(featureHex, val, onPresetUnlocked = null, delayMs = 120) {
-        if (this._timers.has(featureHex)) {
-            GLib.source_remove(this._timers.get(featureHex));
-            this._timers.delete(featureHex);
+    /**
+     * Debounced VCP setter for continuous sliders.
+     * Collapses high-frequency mouse movements into single hardware writes.
+     */
+    setVcpContinuous(featureHex, val, onPresetUnlocked = null, delayMs = 100) {
+        const normFeature = featureHex.toLowerCase();
+        this._pendingValues.set(normFeature, { val, onPresetUnlocked });
+
+        if (this._timers.has(normFeature)) {
+            GLib.source_remove(this._timers.get(normFeature));
+            this._timers.delete(normFeature);
         }
 
         const timerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
-            this._timers.delete(featureHex);
-
-            this._enqueue(async () => {
-                // When in sRGB (01), the monitor firmware locks Contrast (12) and RGB Gain (16, 18, 1a).
-                // Automatically switch to User 1 (0b) so the hardware unlocks and applies the change.
-                const isColorAdjustment = ['12', '16', '18', '1a'].includes(featureHex.toLowerCase());
-                if (isColorAdjustment && this._currentPreset === '01') {
-                    console.log('[ExternalMonitorControl] sRGB preset active: unlocking monitor into User 1 custom mode.');
-                    this._currentPreset = '0b';
-                    if (onPresetUnlocked) {
-                        onPresetUnlocked('0b');
-                    }
-                    await runDdcutilAsync([
-                        '--bus', String(this._bus),
-                        '--noverify',
-                        'setvcp', '14', '0x0b'
-                    ]);
-                    // Settle pause for monitor EEPROM/matrix transition
-                    await new Promise(r => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 80, () => { r(); return GLib.SOURCE_REMOVE; }));
-                }
-
-                return await runDdcutilAsync([
-                    '--bus', String(this._bus),
-                    '--noverify',
-                    'setvcp', featureHex, String(val)
-                ]);
-            });
-
+            this._timers.delete(normFeature);
+            this.flush(normFeature);
             return GLib.SOURCE_REMOVE;
         });
 
-        this._timers.set(featureHex, timerId);
+        this._timers.set(normFeature, timerId);
     }
 
-    setVcpImmediate(featureHex, val) {
-        if (this._timers.has(featureHex)) {
-            GLib.source_remove(this._timers.get(featureHex));
-            this._timers.delete(featureHex);
+    /**
+     * Immediately dispatches any pending debounced value (e.g. on mouse release / drag-end).
+     */
+    flush(featureHex) {
+        const normFeature = featureHex.toLowerCase();
+        if (this._timers.has(normFeature)) {
+            GLib.source_remove(this._timers.get(normFeature));
+            this._timers.delete(normFeature);
         }
+
+        const item = this._pendingValues.get(normFeature);
+        if (!item) return;
+        this._pendingValues.delete(normFeature);
+
+        const { val, onPresetUnlocked } = item;
+
+        this._enqueue(async () => {
+            // When in sRGB (01), the monitor firmware locks Contrast (12) and RGB Gain (16, 18, 1a).
+            // Automatically switch to User 1 (0b) so the hardware unlocks and applies the change.
+            const isColorAdjustment = ['12', '16', '18', '1a'].includes(normFeature);
+            if (isColorAdjustment && this._currentPreset === '01') {
+                this._currentPreset = '0b';
+                if (onPresetUnlocked) {
+                    onPresetUnlocked('0b');
+                }
+                await runDdcutilAsync([
+                    '--bus', String(this._bus),
+                    '--noverify',
+                    'setvcp', '14', '0x0b'
+                ], this._cancellable);
+                // Brief pause for monitor EEPROM/matrix transition
+                await new Promise(r => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 80, () => { r(); return GLib.SOURCE_REMOVE; }));
+            }
+
+            return await runDdcutilAsync([
+                '--bus', String(this._bus),
+                '--noverify',
+                'setvcp', normFeature, String(val)
+            ], this._cancellable);
+        });
+    }
+
+    /**
+     * Immediate VCP set for presets, inputs, and power toggles.
+     */
+    setVcpImmediate(featureHex, val) {
+        const normFeature = featureHex.toLowerCase();
+        if (this._timers.has(normFeature)) {
+            GLib.source_remove(this._timers.get(normFeature));
+            this._timers.delete(normFeature);
+        }
+        this._pendingValues.delete(normFeature);
 
         return this._enqueue(async () => {
             return await runDdcutilAsync([
                 '--bus', String(this._bus),
                 '--noverify',
-                'setvcp', featureHex, String(val)
-            ]);
+                'setvcp', normFeature, String(val)
+            ], this._cancellable);
         });
     }
 
     destroy() {
+        this._cancellable.cancel();
         for (const [_, id] of this._timers) {
             GLib.source_remove(id);
         }
         this._timers.clear();
+        this._pendingValues.clear();
     }
 }
 
+/**
+ * High-performance Slider Menu Item.
+ * Filters out sub-integer floating point jitter to avoid unnecessary Clutter relayout passes.
+ */
 const SliderMenuItem = GObject.registerClass(
 class SliderMenuItem extends PopupMenu.PopupBaseMenuItem {
-    _init(iconName, labelText, initialPercent, onValueChanged) {
+    _init(iconName, labelText, initialPercent, onValueChanged, onDragEnd = null) {
         super._init({ activate: false, reactive: true });
 
         this._onValueChanged = onValueChanged;
+        this._onDragEnd = onDragEnd;
         this._isInternalUpdate = false;
+        this._lastReportedPct = Math.round(initialPercent);
 
         const box = new St.BoxLayout({
             style_class: 'emc-slider-row',
@@ -170,7 +225,7 @@ class SliderMenuItem extends PopupMenu.PopupBaseMenuItem {
         box.add_child(this._slider);
 
         this._valueLabel = new St.Label({
-            text: `${Math.round(initialPercent)}%`,
+            text: `${this._lastReportedPct}%`,
             style_class: 'emc-slider-value',
             y_align: Clutter.ActorAlign.CENTER,
         });
@@ -178,24 +233,37 @@ class SliderMenuItem extends PopupMenu.PopupBaseMenuItem {
 
         this.add_child(box);
 
+        // Fast integer filter: only re-render and dispatch when rounded percentage changes
         this._slider.connect('notify::value', () => {
             const pct = Math.round(this._slider.value * 100);
+            if (pct === this._lastReportedPct) return;
+            this._lastReportedPct = pct;
             this._valueLabel.set_text(`${pct}%`);
             if (!this._isInternalUpdate && this._onValueChanged) {
                 this._onValueChanged(pct);
             }
         });
+
+        // Instant hardware flush on mouse release
+        this._slider.connect('drag-end', () => {
+            if (this._onDragEnd) {
+                this._onDragEnd(this._lastReportedPct);
+            }
+        });
     }
 
     setValue(pct) {
+        const rounded = Math.round(Math.min(100, Math.max(0, pct)));
+        if (rounded === this._lastReportedPct && this._isInternalUpdate) return;
         this._isInternalUpdate = true;
-        this._slider.value = Math.min(100, Math.max(0, pct)) / 100;
-        this._valueLabel.set_text(`${Math.round(pct)}%`);
+        this._lastReportedPct = rounded;
+        this._slider.value = rounded / 100;
+        this._valueLabel.set_text(`${rounded}%`);
         this._isInternalUpdate = false;
     }
 
     getValue() {
-        return Math.round(this._slider.value * 100);
+        return this._lastReportedPct;
     }
 });
 
@@ -208,6 +276,7 @@ class MonitorControlIndicator extends PanelMenu.Button {
         this._monitorName = 'Lenovo L24-4C';
         this._worker = new DdcWorker(this._bus);
         this._isLoading = false;
+        this._lastFetchTime = 0;
 
         // Top bar icon
         this._icon = new St.Icon({
@@ -218,10 +287,32 @@ class MonitorControlIndicator extends PanelMenu.Button {
 
         this._buildMenu();
 
-        // Refresh whenever menu is opened
+        // Top bar scroll-wheel shortcut: scroll over icon to adjust brightness +/- 5%
+        this.connect('scroll-event', (_actor, event) => {
+            const direction = event.get_scroll_direction();
+            let delta = 0;
+            if (direction === Clutter.ScrollDirection.UP) {
+                delta = 5;
+            } else if (direction === Clutter.ScrollDirection.DOWN) {
+                delta = -5;
+            } else if (direction === Clutter.ScrollDirection.SMOOTH) {
+                const [, dy] = event.get_scroll_delta();
+                delta = dy < 0 ? 5 : -5;
+            }
+            if (delta !== 0) {
+                this._stepBrightness(delta);
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
+
+        // Refresh when menu is opened (uses TTL cache to avoid redundant I2C bus traffic)
         this.menu.connect('open-state-changed', (menu, isOpen) => {
             if (isOpen) {
-                this._refreshValues();
+                const now = Date.now();
+                if (now - this._lastFetchTime > CACHE_TTL_MS) {
+                    this._refreshValues(false);
+                }
             }
         });
 
@@ -229,10 +320,20 @@ class MonitorControlIndicator extends PanelMenu.Button {
         this._detectMonitorAndRefresh();
     }
 
+    _stepBrightness(delta) {
+        const cur = this._brightnessItem.getValue();
+        const next = Math.min(100, Math.max(0, cur + delta));
+        if (cur !== next) {
+            this._brightnessItem.setValue(next);
+            this._worker.setVcpContinuous('10', next, null, 80);
+            this._worker.flush('10');
+        }
+    }
+
     _buildMenu() {
         this.menu.box.add_style_class_name('emc-menu-box');
 
-        // Header Section: Monitor Name + Refresh
+        // Header Section: Monitor Name + Manual Force-Refresh
         const headerItem = new PopupMenu.PopupBaseMenuItem({ activate: false, reactive: false });
         const headerBox = new St.BoxLayout({ x_expand: true, y_align: Clutter.ActorAlign.CENTER });
         
@@ -255,7 +356,7 @@ class MonitorControlIndicator extends PanelMenu.Button {
             can_focus: true,
             y_align: Clutter.ActorAlign.CENTER,
         });
-        refreshBtn.connect('clicked', () => this._refreshValues());
+        refreshBtn.connect('clicked', () => this._refreshValues(true));
         headerBox.add_child(refreshBtn);
 
         headerItem.add_child(headerBox);
@@ -268,7 +369,8 @@ class MonitorControlIndicator extends PanelMenu.Button {
             'display-brightness-symbolic',
             'Brightness',
             100,
-            (val) => this._worker.setVcpContinuous('10', val)
+            (val) => this._worker.setVcpContinuous('10', val, null, 90),
+            () => this._worker.flush('10')
         );
         this.menu.addMenuItem(this._brightnessItem);
 
@@ -277,7 +379,8 @@ class MonitorControlIndicator extends PanelMenu.Button {
             'weather-clear-symbolic',
             'Contrast',
             75,
-            (val) => this._worker.setVcpContinuous('12', val, (unlocked) => this._selectPreset(unlocked))
+            (val) => this._worker.setVcpContinuous('12', val, (unlocked) => this._selectPreset(unlocked), 90),
+            () => this._worker.flush('12')
         );
         this.menu.addMenuItem(this._contrastItem);
 
@@ -286,7 +389,8 @@ class MonitorControlIndicator extends PanelMenu.Button {
             'audio-volume-high-symbolic',
             'Volume',
             100,
-            (val) => this._worker.setVcpContinuous('62', val)
+            (val) => this._worker.setVcpContinuous('62', val, null, 90),
+            () => this._worker.flush('62')
         );
         this.menu.addMenuItem(this._volumeItem);
 
@@ -323,7 +427,8 @@ class MonitorControlIndicator extends PanelMenu.Button {
             'media-record-symbolic',
             'Red',
             100,
-            (val) => this._worker.setVcpContinuous('16', val, (unlocked) => this._selectPreset(unlocked))
+            (val) => this._worker.setVcpContinuous('16', val, (unlocked) => this._selectPreset(unlocked), 90),
+            () => this._worker.flush('16')
         );
         this._rgbSubMenu.menu.addMenuItem(this._redItem);
 
@@ -331,7 +436,8 @@ class MonitorControlIndicator extends PanelMenu.Button {
             'media-record-symbolic',
             'Green',
             100,
-            (val) => this._worker.setVcpContinuous('18', val, (unlocked) => this._selectPreset(unlocked))
+            (val) => this._worker.setVcpContinuous('18', val, (unlocked) => this._selectPreset(unlocked), 90),
+            () => this._worker.flush('18')
         );
         this._rgbSubMenu.menu.addMenuItem(this._greenItem);
 
@@ -339,7 +445,8 @@ class MonitorControlIndicator extends PanelMenu.Button {
             'media-record-symbolic',
             'Blue',
             100,
-            (val) => this._worker.setVcpContinuous('1a', val, (unlocked) => this._selectPreset(unlocked))
+            (val) => this._worker.setVcpContinuous('1a', val, (unlocked) => this._selectPreset(unlocked), 90),
+            () => this._worker.flush('1a')
         );
         this._rgbSubMenu.menu.addMenuItem(this._blueItem);
 
@@ -426,11 +533,14 @@ class MonitorControlIndicator extends PanelMenu.Button {
                 }
             }
         }
-        await this._refreshValues();
+        await this._refreshValues(true);
     }
 
-    async _refreshValues() {
+    async _refreshValues(force = false) {
         if (this._isLoading) return;
+        const now = Date.now();
+        if (!force && now - this._lastFetchTime < CACHE_TTL_MS) return;
+
         this._isLoading = true;
 
         try {
@@ -441,6 +551,7 @@ class MonitorControlIndicator extends PanelMenu.Button {
             ]);
 
             if (res && res.success && res.stdout) {
+                this._lastFetchTime = Date.now();
                 const lines = res.stdout.split('\n');
                 for (const line of lines) {
                     // Continuous features: current value = X, max value = Y
